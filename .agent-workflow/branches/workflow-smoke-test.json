@@ -1,0 +1,30 @@
+{
+  "base": "origin/main",
+  "branch": "workflow-smoke-test",
+  "created_at": "2026-05-25T16:38:13+00:00",
+  "created_from_sha": "4ae67646744c4da89e1f0ccdb9d7a9482dfbfdd9",
+  "linked_issues": [],
+  "owner_agent": "Basil",
+  "pr": null,
+  "reviews": [
+    {
+      "agent": "GPT Code Review",
+      "path": ".agent-workflow/reviews/workflow-smoke-test/20260525T163813Z-gpt-code-review.md",
+      "recorded_at": "2026-05-25T16:38:13+00:00",
+      "verdict": "commented"
+    }
+  ],
+  "schema_version": 1,
+  "status": "local",
+  "summary": "Verify local-private ledger commands.",
+  "tests": [
+    {
+      "command": "python -m py_compile scripts/agent_review_workflow.py",
+      "notes": "",
+      "recorded_at": "2026-05-25T16:38:13+00:00",
+      "result": "pass"
+    }
+  ],
+  "title": "chore: smoke test local workflow",
+  "updated_at": "2026-05-25T16:38:13+00:00"
+}

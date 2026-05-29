@@ -200,6 +200,38 @@ class TestReasoningCommand:
 
         assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
 
+    def test_resolve_session_reasoning_uses_channel_runtime_binding(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        source = _make_event("/reasoning").source
+
+        assert runner._resolve_session_reasoning_config(
+            source=source,
+            channel_runtime={"reasoning_effort": "high"},
+        ) == {"enabled": True, "effort": "high"}
+
+    def test_resolve_session_reasoning_session_override_wins_over_channel_runtime(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        source = _make_event("/reasoning").source
+        session_key = runner._session_key_for_source(source)
+        runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "xhigh"}
+
+        assert runner._resolve_session_reasoning_config(
+            source=source,
+            channel_runtime={"reasoning_effort": "high"},
+        ) == {"enabled": True, "effort": "xhigh"}
+
     def test_run_agent_reloads_reasoning_config_per_message(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()

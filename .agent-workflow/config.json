@@ -1,0 +1,17 @@
+{
+  "base_branch": "origin/main",
+  "fork_owner": "PeterBerthelsen",
+  "fork_remote": "peter",
+  "privacy": "local-private-until-explicit-push",
+  "review_policy": {
+    "external_agent_outputs_are_private_by_default": true,
+    "pre_push_reviews_required": 1,
+    "required_checks": [
+      "git diff --check",
+      "python -m pytest"
+    ]
+  },
+  "schema_version": 1,
+  "upstream_remote": "origin",
+  "upstream_repo": "NousResearch/hermes-agent"
+}

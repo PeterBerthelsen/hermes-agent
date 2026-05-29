@@ -473,6 +473,36 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
+    def test_bridges_slack_channel_runtime_bindings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "slack:\n"
+            "  channel_runtime_bindings:\n"
+            "    - id: \"*\"\n"
+            "      model: gpt-5.5\n"
+            "      reasoning_effort: high\n"
+            "      prompt: Onboard this channel.\n"
+            "    - id: C0CODE\n"
+            "      model: gpt-5.4-mini\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].extra["channel_runtime_bindings"] == [
+            {
+                "id": "*",
+                "model": "gpt-5.5",
+                "reasoning_effort": "high",
+                "prompt": "Onboard this channel.",
+            },
+            {"id": "C0CODE", "model": "gpt-5.4-mini"},
+        ]
+
     def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

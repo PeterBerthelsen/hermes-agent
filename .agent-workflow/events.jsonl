@@ -1,0 +1,6 @@
+{"ts": "2026-05-25T16:37:38+00:00", "type": "init", "workflow_dir": ".agent-workflow"}
+{"ts": "2026-05-25T16:37:38+00:00", "type": "init", "workflow_dir": ".agent-workflow"}
+{"agent": "Basil", "branch": "workflow-smoke-test", "path": ".agent-workflow/branches/workflow-smoke-test.json", "ts": "2026-05-25T16:38:13+00:00", "type": "branch_start"}
+{"agent": "GPT Code Review", "branch": "workflow-smoke-test", "path": ".agent-workflow/reviews/workflow-smoke-test/20260525T163813Z-gpt-code-review.md", "ts": "2026-05-25T16:38:13+00:00", "type": "review_recorded", "verdict": "commented"}
+{"branch": "workflow-smoke-test", "command": "python -m py_compile scripts/agent_review_workflow.py", "result": "pass", "ts": "2026-05-25T16:38:13+00:00", "type": "test_recorded"}
+{"ts": "2026-05-25T17:05:29+00:00", "type": "init", "workflow_dir": ".agent-workflow"}

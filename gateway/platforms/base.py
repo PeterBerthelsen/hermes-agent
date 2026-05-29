@@ -1187,6 +1187,10 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Per-channel model/runtime defaults.  Applied at API call time and never
+    # persisted to transcript history.
+    channel_runtime: Optional[Dict[str, Any]] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the
@@ -1498,6 +1502,93 @@ def resolve_channel_skills(
                     if nm and nm not in seen:
                         seen.append(nm)
                 return seen or None
+    return None
+
+
+_CHANNEL_RUNTIME_KEYS = (
+    "model",
+    "provider",
+    "base_url",
+    "api_mode",
+    "reasoning_effort",
+    "prompt",
+    "system_prompt",
+    "personality",
+)
+
+
+def _normalize_binding_ids(entry: dict) -> list[str]:
+    raw_ids = entry.get("ids", entry.get("id"))
+    if isinstance(raw_ids, (list, tuple, set)):
+        values = raw_ids
+    else:
+        values = [raw_ids]
+    return [str(v).strip() for v in values if str(v or "").strip()]
+
+
+def _coerce_channel_runtime_binding(entry: dict) -> dict | None:
+    runtime: dict[str, str] = {}
+    for key in _CHANNEL_RUNTIME_KEYS:
+        value = entry.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if key == "system_prompt":
+            runtime.setdefault("prompt", text)
+        else:
+            runtime[key] = text
+    return runtime or None
+
+
+def resolve_channel_runtime_binding(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> dict | None:
+    """Resolve per-channel runtime defaults from platform config.
+
+    Config format::
+
+        channel_runtime_bindings:
+          - id: "C0123"
+            provider: openai-codex
+            model: gpt-5.5
+            reasoning_effort: high
+            prompt: "Channel-specific instructions"
+          - id: "*"             # fallback for channels without an exact binding
+            model: gpt-5.5
+
+    Exact channel/thread matches win, then parent matches, then entries marked
+    ``default: true`` or with id ``*``/``default``.
+    """
+    bindings = config_extra.get("channel_runtime_bindings") or []
+    if not isinstance(bindings, list) or not bindings:
+        return None
+
+    exact_ids: list[str] = []
+    if channel_id:
+        exact_ids.append(str(channel_id))
+    if parent_id:
+        exact_ids.append(str(parent_id))
+    exact_ids = [item for item in exact_ids if item]
+
+    default_entry: dict | None = None
+    for entry in bindings:
+        if not isinstance(entry, dict):
+            continue
+        entry_ids = _normalize_binding_ids(entry)
+        is_default = bool(entry.get("default")) or any(
+            item.lower() in {"*", "default"} for item in entry_ids
+        )
+        if is_default and default_entry is None:
+            default_entry = entry
+        if exact_ids and any(item in exact_ids for item in entry_ids):
+            return _coerce_channel_runtime_binding(entry)
+
+    if default_entry is not None:
+        return _coerce_channel_runtime_binding(default_entry)
     return None
 
 

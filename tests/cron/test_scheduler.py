@@ -7,7 +7,16 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import (
+    _resolve_origin,
+    _resolve_delivery_target,
+    _resolve_cron_reasoning_config,
+    _deliver_result,
+    _send_media_via_adapter,
+    run_job,
+    SILENT_MARKER,
+    _build_job_prompt,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -68,6 +77,35 @@ class TestResolveOrigin:
         """
         job = {"origin": non_dict_origin}
         assert _resolve_origin(job) is None
+
+
+class TestResolveCronReasoningConfig:
+    def test_per_job_reasoning_effort_overrides_global_config(self):
+        job = {"reasoning_effort": "xhigh"}
+        cfg = {"agent": {"reasoning_effort": "low"}}
+
+        assert _resolve_cron_reasoning_config(job, cfg) == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+
+    def test_global_reasoning_effort_used_when_job_unset(self):
+        job = {}
+        cfg = {"agent": {"reasoning_effort": "high"}}
+
+        assert _resolve_cron_reasoning_config(job, cfg) == {
+            "enabled": True,
+            "effort": "high",
+        }
+
+    def test_none_reasoning_effort_disables_reasoning(self):
+        assert _resolve_cron_reasoning_config({"reasoning_effort": "none"}, {}) == {
+            "enabled": False,
+        }
+
+    def test_missing_or_invalid_reasoning_effort_preserves_default(self):
+        assert _resolve_cron_reasoning_config({}, {}) is None
+        assert _resolve_cron_reasoning_config({"reasoning_effort": "bogus"}, {}) is None
 
 
 class TestResolveDeliveryTarget:
@@ -836,6 +874,190 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
+    def test_slack_delivery_without_thread_creates_title_parent(self):
+        """Slack cron reports without a parent get a title post plus threaded details."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        job = {
+            "id": "test-job",
+            "name": "Daily Report",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={
+                 "success": True,
+                 "message_id": "reply-ts",
+                 "thread_parent_ts": "parent-ts",
+             })) as send_mock:
+            result = _deliver_result(job, "details")
+
+        assert result is None
+        send_mock.assert_called_once()
+        assert send_mock.call_args.args[3] == "details"
+        assert send_mock.call_args.kwargs["thread_id"] is None
+        assert send_mock.call_args.kwargs["thread_title"] == "Daily Report"
+
+    def test_slack_live_adapter_creates_title_parent_for_empty_body(self):
+        """Media-only or empty Slack deliveries still create the title parent."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        send_result = MagicMock(
+            success=True,
+            message_id="parent-ts",
+            raw_response={"thread_parent_ts": "parent-ts"},
+        )
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(send_result)
+            coro.close()
+            return future
+
+        job = {
+            "id": "empty-job",
+            "name": "Empty Report",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = _deliver_result(
+                job,
+                "",
+                adapters={Platform.SLACK: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send.assert_called_once_with(
+            "C123",
+            "",
+            metadata={"thread_title": "Empty Report"},
+        )
+        send_mock.assert_not_called()
+
+    def test_slack_delivery_child_uses_recorded_group_anchor(self):
+        """delivery_thread child jobs reuse the scheduler-owned Slack parent anchor."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        job = {
+            "id": "child-job",
+            "name": "Child Report",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+            "delivery_thread": {"group": "overnight-cron", "role": "child"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._lookup_slack_thread_anchor", return_value="parent-ts"), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={
+                 "success": True,
+                 "message_id": "reply-ts",
+             })) as send_mock:
+            result = _deliver_result(job, "details")
+
+        assert result is None
+        assert send_mock.call_args.kwargs["thread_id"] == "parent-ts"
+        assert "thread_title" not in send_mock.call_args.kwargs or send_mock.call_args.kwargs["thread_title"] is None
+
+    def test_slack_delivery_parent_records_group_anchor(self):
+        """delivery_thread parent jobs post title-only and save the returned parent ts."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        job = {
+            "id": "parent-job",
+            "name": "daily-slack-anchor-overnight-cron",
+            "static_response": "Overnight Cron",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+            "delivery_thread": {"group": "overnight-cron", "role": "parent"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._lookup_slack_thread_anchor", return_value=None), \
+             patch("cron.scheduler._record_slack_thread_anchor") as record_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={
+                 "success": True,
+                 "message_id": "parent-ts",
+             })) as send_mock:
+            result = _deliver_result(job, "Overnight Cron")
+
+        assert result is None
+        assert send_mock.call_args.args[3] == "Overnight Cron"
+        assert send_mock.call_args.kwargs["thread_id"] is None
+        assert send_mock.call_args.kwargs["thread_title"] is None
+        record_mock.assert_called_once_with("C123", "overnight-cron", "Overnight Cron", "parent-ts")
+
+    def test_slack_delivery_parent_without_static_response_uses_content_title(self):
+        """Script/agent anchor jobs can supply a dated title as their response body."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+
+        job = {
+            "id": "parent-job",
+            "name": "weekly-slack-anchor-substack-operator-brief",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+            "delivery_thread": {"group": "substack-operator-brief", "role": "parent"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._lookup_slack_thread_anchor", return_value=None), \
+             patch("cron.scheduler._record_slack_thread_anchor") as record_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={
+                 "success": True,
+                 "message_id": "parent-ts",
+             })) as send_mock:
+            result = _deliver_result(job, "Substack Operator Brief - 2026-05-28")
+
+        assert result is None
+        assert send_mock.call_args.args[3] == "Substack Operator Brief - 2026-05-28"
+        record_mock.assert_called_once_with(
+            "C123",
+            "substack-operator-brief",
+            "Substack Operator Brief - 2026-05-28",
+            "parent-ts",
+        )
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
@@ -868,6 +1090,20 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_static_response_skips_agent(self):
+        job = {
+            "id": "anchor",
+            "name": "anchor job",
+            "static_response": "Overnight Cron",
+        }
+
+        success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "Overnight Cron"
+        assert "**Mode:** static_response" in output
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",

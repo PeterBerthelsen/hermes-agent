@@ -57,6 +57,7 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_SLACK_THREAD_TITLE_MAX = 180
 
 
 def _sanitize_error_text(text) -> str:
@@ -70,6 +71,39 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _normalize_slack_thread_title(title: str, fallback: str = "Basil Report") -> str:
+    """Return a compact Slack parent-message title."""
+    text = str(title or "").strip()
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text)
+    text = text.strip(" \t*_`")
+    text = " ".join(text.split())
+    if not text:
+        text = fallback
+    if len(text) > _SLACK_THREAD_TITLE_MAX:
+        text = text[: _SLACK_THREAD_TITLE_MAX - 1].rstrip() + "..."
+    return text
+
+
+def _split_slack_thread_message(message: str, fallback: str = "Basil Report") -> tuple[str, str]:
+    """Split a top-level Slack initiated message into title and body.
+
+    The first non-empty line becomes the visible parent title; remaining text
+    becomes the threaded detail body. Single-line messages become title-only
+    parent posts.
+    """
+    lines = str(message or "").splitlines()
+    title_index = None
+    for idx, line in enumerate(lines):
+        if line.strip():
+            title_index = idx
+            break
+    if title_index is None:
+        return fallback, ""
+    title = _normalize_slack_thread_title(lines[title_index], fallback=fallback)
+    body_lines = lines[:title_index] + lines[title_index + 1 :]
+    return title, "\n".join(body_lines).strip()
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -300,15 +334,29 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        message_to_send = cleaned_message
+        thread_title = None
+        if platform_name == "slack" and not thread_id:
+            thread_title, message_to_send = _split_slack_thread_message(
+                cleaned_message,
+                fallback="Basil Message",
+            )
+
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        if thread_title is not None:
+            send_kwargs["thread_title"] = thread_title
+
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
-                cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                message_to_send,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -555,7 +603,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    thread_title=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -581,6 +638,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _feishu_available = False
 
     media_files = media_files or []
+
+    formatted_thread_title = None
+    if platform == Platform.SLACK and thread_title:
+        try:
+            slack_adapter = SlackAdapter.__new__(SlackAdapter)
+            formatted_thread_title = slack_adapter.format_message(thread_title)
+        except Exception:
+            logger.debug("Failed to apply Slack mrkdwn formatting to thread title", exc_info=True)
+            formatted_thread_title = thread_title
 
     if platform == Platform.SLACK and message:
         try:
@@ -734,6 +800,55 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack initiated reports: optional title parent plus threaded details ---
+    if platform == Platform.SLACK and formatted_thread_title:
+        warning = None
+        if media_files:
+            warning = (
+                "MEDIA attachments were omitted for slack; native send_message media delivery "
+                "is currently only supported through the running gateway adapter"
+            )
+        effective_thread_id = thread_id
+        parent_result = None
+        if not effective_thread_id:
+            parent_result = await _send_slack(pconfig.token, chat_id, formatted_thread_title)
+            if isinstance(parent_result, dict) and parent_result.get("error"):
+                return parent_result
+            if isinstance(parent_result, dict):
+                effective_thread_id = parent_result.get("message_id")
+            if not effective_thread_id:
+                return {"error": "Slack title post did not return a thread timestamp"}
+
+        last_result = parent_result
+        for chunk in chunks:
+            if not str(chunk).strip():
+                continue
+            result = await _send_slack(
+                pconfig.token,
+                chat_id,
+                chunk,
+                thread_id=effective_thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+
+        if last_result is None:
+            last_result = {
+                "success": True,
+                "platform": "slack",
+                "chat_id": chat_id,
+                "message_id": effective_thread_id,
+            }
+        if isinstance(last_result, dict) and last_result.get("success"):
+            last_result["thread_parent_ts"] = effective_thread_id
+            last_result.setdefault("thread_id", effective_thread_id)
+            if warning:
+                warnings = list(last_result.get("warnings", []))
+                warnings.append(warning)
+                last_result["warnings"] = warnings
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
@@ -752,7 +867,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk)
+            result = await _send_slack(pconfig.token, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -1034,7 +1149,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message):
+async def _send_slack(token, chat_id, message, thread_id=None):
     """Send via Slack Web API."""
     try:
         import aiohttp
@@ -1048,6 +1163,8 @@ async def _send_slack(token, chat_id, message):
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+            if thread_id:
+                payload["thread_ts"] = thread_id
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):

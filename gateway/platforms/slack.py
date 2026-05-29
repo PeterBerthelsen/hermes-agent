@@ -785,6 +785,20 @@ class SlackAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            created_thread_ts = None
+            if not thread_ts and metadata and metadata.get("thread_title"):
+                title = self.format_message(str(metadata.get("thread_title") or "").strip())
+                title_chunks = self.truncate_message(title, self.MAX_MESSAGE_LENGTH)
+                title_text = (title_chunks[0] if title_chunks else "").strip() or "Basil Report"
+                parent_result = await self._get_client(chat_id).chat_postMessage(
+                    channel=chat_id,
+                    text=title_text,
+                    mrkdwn=True,
+                )
+                created_thread_ts = parent_result.get("ts") if parent_result else None
+                if not created_thread_ts:
+                    return SendResult(success=False, error="Slack title post did not return a thread timestamp")
+                thread_ts = created_thread_ts
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -792,6 +806,8 @@ class SlackAdapter(BasePlatformAdapter):
             broadcast = self.config.extra.get("reply_broadcast", False)
 
             for i, chunk in enumerate(chunks):
+                if created_thread_ts and not str(chunk).strip():
+                    continue
                 kwargs = {
                     "channel": chat_id,
                     "text": chunk,
@@ -800,10 +816,13 @@ class SlackAdapter(BasePlatformAdapter):
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                     # Only broadcast the first chunk of the first reply
-                    if broadcast and i == 0:
+                    if broadcast and i == 0 and not created_thread_ts:
                         kwargs["reply_broadcast"] = True
 
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+
+            if created_thread_ts and last_result is None:
+                last_result = {"ts": created_thread_ts}
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -822,10 +841,16 @@ class SlackAdapter(BasePlatformAdapter):
                     for old_ts in list(self._bot_message_ts)[:excess]:
                         self._bot_message_ts.discard(old_ts)
 
+            raw_response = last_result
+            if created_thread_ts and isinstance(raw_response, dict):
+                raw_response = dict(raw_response)
+                raw_response["thread_parent_ts"] = created_thread_ts
+                raw_response.setdefault("thread_id", created_thread_ts)
+
             return SendResult(
                 success=True,
                 message_id=sent_ts,
-                raw_response=last_result,
+                raw_response=raw_response,
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -2189,9 +2214,16 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_ts,
         )
 
-        # Per-channel ephemeral prompt
-        from gateway.platforms.base import resolve_channel_prompt, resolve_channel_skills
+        # Per-channel ephemeral prompt / skills / runtime defaults.
+        from gateway.platforms.base import (
+            resolve_channel_prompt,
+            resolve_channel_runtime_binding,
+            resolve_channel_skills,
+        )
         _channel_prompt = resolve_channel_prompt(
+            self.config.extra, channel_id, None,
+        )
+        _channel_runtime = resolve_channel_runtime_binding(
             self.config.extra, channel_id, None,
         )
         _auto_skill = resolve_channel_skills(
@@ -2224,6 +2256,7 @@ class SlackAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
             channel_prompt=_channel_prompt,
+            channel_runtime=_channel_runtime,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
         )

@@ -594,6 +594,99 @@ class TestSendToPlatformChunking:
             "***",
             "C123",
             "*hello* from <https://example.com|Hermes>",
+            thread_id=None,
+        )
+
+    def test_slack_thread_id_is_passed_to_standalone_send(self, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+
+        import gateway.platforms.slack as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "reply-ts"})
+
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "threaded details",
+                    thread_id="parent-ts",
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            "***",
+            "C123",
+            "threaded details",
+            thread_id="parent-ts",
+        )
+
+    def test_slack_thread_title_posts_parent_then_details(self, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+
+        import gateway.platforms.slack as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        sent = []
+
+        async def send(_token, _chat_id, message, thread_id=None):
+            sent.append((message, thread_id))
+            msg_id = "parent-ts" if thread_id is None else f"reply-{len(sent)}"
+            return {"success": True, "message_id": msg_id}
+
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "Details line",
+                    thread_title="Report Title",
+                )
+            )
+
+        assert result["success"] is True
+        assert result["thread_parent_ts"] == "parent-ts"
+        assert sent == [
+            ("Report Title", None),
+            ("Details line", "parent-ts"),
+        ]
+
+    def test_top_level_slack_tool_send_splits_title_and_body(self):
+        slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:C123ABCDEF",
+                        "message": "Report Title\nDetails line",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "C123ABCDEF",
+            "Details line",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+            thread_title="Report Title",
         )
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):

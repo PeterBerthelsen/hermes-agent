@@ -2354,12 +2354,12 @@ class GatewayRunner:
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        channel_runtime: Optional[dict] = None,
     ) -> tuple[str, dict]:
-        """Resolve model/runtime for a session, honoring session-scoped /model overrides.
+        """Resolve model/runtime for a session.
 
-        If the session override already contains a complete provider bundle
-        (provider/api_key/base_url/api_mode), prefer it directly instead of
-        resolving fresh global runtime state first.
+        Precedence: session-scoped /model override, channel runtime binding,
+        global config/runtime.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -2411,6 +2411,13 @@ class GatewayRunner:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+        elif channel_runtime:
+            model, runtime_kwargs = self._apply_channel_runtime_binding(
+                model,
+                runtime_kwargs,
+                channel_runtime,
+                session_key=resolved_session_key,
+            )
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -2429,6 +2436,78 @@ class GatewayRunner:
                 pass
 
         return model, runtime_kwargs
+
+    @staticmethod
+    def _apply_channel_runtime_binding(
+        model: str,
+        runtime_kwargs: dict,
+        channel_runtime: Optional[dict],
+        *,
+        session_key: Optional[str] = None,
+    ) -> tuple[str, dict]:
+        if not isinstance(channel_runtime, dict) or not channel_runtime:
+            return model, runtime_kwargs
+
+        runtime_kwargs = dict(runtime_kwargs or {})
+        bound_model = str(channel_runtime.get("model") or "").strip()
+        if bound_model:
+            model = bound_model
+
+        for key in ("provider", "base_url", "api_mode"):
+            value = str(channel_runtime.get(key) or "").strip()
+            if value:
+                runtime_kwargs[key] = value
+
+        logger.debug(
+            "Channel runtime binding applied: session=%s model=%s provider=%s",
+            session_key or "",
+            model,
+            runtime_kwargs.get("provider"),
+        )
+        return model, runtime_kwargs
+
+    @staticmethod
+    def _resolve_personality_prompt(value: Any) -> str:
+        if isinstance(value, dict):
+            parts = [value.get("system_prompt", "")]
+            if value.get("tone"):
+                parts.append(f'Tone: {value["tone"]}')
+            if value.get("style"):
+                parts.append(f'Style: {value["style"]}')
+            return "\n".join(str(p).strip() for p in parts if str(p or "").strip())
+        return str(value or "").strip()
+
+    @classmethod
+    def _resolve_channel_runtime_prompt(
+        cls,
+        channel_runtime: Optional[dict],
+        user_config: Optional[dict] = None,
+    ) -> str:
+        if not isinstance(channel_runtime, dict) or not channel_runtime:
+            return ""
+
+        parts: list[str] = []
+        personality = str(channel_runtime.get("personality") or "").strip()
+        if personality:
+            personalities = cfg_get(user_config or {}, "agent", "personalities", default={})
+            if isinstance(personalities, dict):
+                prompt = cls._resolve_personality_prompt(personalities.get(personality))
+                if prompt:
+                    parts.append(prompt)
+                else:
+                    logger.warning(
+                        "Channel runtime references unknown personality '%s'",
+                        personality,
+                    )
+
+        prompt = str(
+            channel_runtime.get("prompt")
+            or channel_runtime.get("system_prompt")
+            or ""
+        ).strip()
+        if prompt:
+            parts.append(prompt)
+        return "\n\n".join(parts)
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -2873,8 +2952,13 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        channel_runtime: Optional[dict] = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session.
+
+        Precedence: session-scoped /reasoning override, channel runtime binding,
+        global config.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -2885,6 +2969,17 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        if isinstance(channel_runtime, dict):
+            effort = str(channel_runtime.get("reasoning_effort") or "").strip()
+            if effort:
+                from hermes_constants import parse_reasoning_effort
+                result = parse_reasoning_effort(effort)
+                if result is not None:
+                    return result
+                logger.warning(
+                    "Unknown channel reasoning_effort '%s', using global default",
+                    effort,
+                )
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -7106,6 +7201,7 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        channel_runtime=getattr(event, "channel_runtime", None),
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
@@ -7133,6 +7229,7 @@ class GatewayRunner:
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            channel_runtime=getattr(event, "channel_runtime", None),
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -7155,6 +7252,7 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        channel_runtime=getattr(event, "channel_runtime", None),
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -8420,6 +8518,7 @@ class GatewayRunner:
                         source=source,
                         session_key=session_key,
                         user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
+                        channel_runtime=getattr(event, "channel_runtime", None),
                     )
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
@@ -8523,6 +8622,7 @@ class GatewayRunner:
                             source=source,
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
+                            channel_runtime=getattr(event, "channel_runtime", None),
                         )
                         if _hyg_runtime.get("api_key"):
                             _hyg_msgs = [
@@ -8748,6 +8848,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                channel_runtime=getattr(event, "channel_runtime", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -10692,6 +10793,7 @@ class GatewayRunner:
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
+            channel_runtime=getattr(event, "channel_runtime", None),
         )
         
         # Let the normal message handler process it
@@ -10813,6 +10915,7 @@ class GatewayRunner:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    channel_runtime=getattr(event, "channel_runtime", None),
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -12212,6 +12315,7 @@ class GatewayRunner:
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
+                channel_runtime=getattr(event, "channel_runtime", None),
             )
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
@@ -15804,6 +15908,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        channel_runtime: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -16509,6 +16614,12 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            runtime_channel_prompt = self._resolve_channel_runtime_prompt(
+                channel_runtime,
+                user_config=user_config,
+            )
+            if runtime_channel_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + runtime_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
@@ -16522,6 +16633,7 @@ class GatewayRunner:
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    channel_runtime=channel_runtime,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -16539,6 +16651,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                channel_runtime=channel_runtime,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -17888,6 +18001,7 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_channel_runtime = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -17905,6 +18019,7 @@ class GatewayRunner:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_channel_runtime = getattr(pending_event, "channel_runtime", None)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -17930,6 +18045,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    channel_runtime=next_channel_runtime,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

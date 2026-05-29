@@ -14,9 +14,11 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -78,6 +80,25 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
         if name and name not in disabled:
             disabled.append(name)
     return disabled
+
+
+def _resolve_cron_reasoning_config(job: dict, cfg: object) -> dict | None:
+    """Resolve reasoning config for a cron-spawned agent.
+
+    Precedence:
+    1. Per-job ``reasoning_effort`` so high-stakes cron jobs can opt into
+       deeper reasoning without changing every scheduled job.
+    2. Global ``agent.reasoning_effort`` from config.yaml.
+    3. ``None`` when unset or unrecognized, preserving provider defaults.
+    """
+    from hermes_constants import parse_reasoning_effort
+
+    per_job = str((job or {}).get("reasoning_effort") or "").strip()
+    if per_job:
+        return parse_reasoning_effort(per_job)
+    cfg_dict = cfg if isinstance(cfg, dict) else {}
+    effort = str((cfg_dict.get("agent") or {}).get("reasoning_effort", "")).strip()
+    return parse_reasoning_effort(effort)
 
 
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
@@ -156,6 +177,8 @@ SILENT_MARKER = "[SILENT]"
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
+_thread_anchor_lock = threading.Lock()
+_THREAD_TITLE_MAX = 180
 
 
 def _get_hermes_home() -> Path:
@@ -168,6 +191,197 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+def _thread_anchor_state_path() -> Path:
+    return _get_hermes_home() / "cron" / "thread_anchors.json"
+
+
+def _read_thread_anchor_state() -> dict:
+    path = _thread_anchor_state_path()
+    if not path.exists():
+        return {"anchors": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read cron thread anchor state from %s", path, exc_info=True)
+        return {"anchors": {}}
+    if not isinstance(data, dict):
+        return {"anchors": {}}
+    anchors = data.get("anchors")
+    if not isinstance(anchors, dict):
+        data["anchors"] = {}
+    return data
+
+
+def _write_thread_anchor_state(state: dict) -> None:
+    path = _thread_anchor_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _thread_anchor_scope() -> str:
+    return _hermes_now().strftime("%Y-%m-%d")
+
+
+def _thread_anchor_key(platform_name: str, chat_id: str, group: str) -> str:
+    return f"{_thread_anchor_scope()}:{platform_name.lower()}:{chat_id}:{group}"
+
+
+def _lookup_slack_thread_anchor(chat_id: str, group: str) -> Optional[str]:
+    key = _thread_anchor_key("slack", str(chat_id), str(group))
+    with _thread_anchor_lock:
+        state = _read_thread_anchor_state()
+        entry = state.get("anchors", {}).get(key)
+    if isinstance(entry, dict):
+        thread_id = entry.get("thread_id")
+        return str(thread_id) if thread_id else None
+    return None
+
+
+def _record_slack_thread_anchor(chat_id: str, group: str, title: str, thread_id: str) -> None:
+    if not chat_id or not group or not thread_id:
+        return
+    key = _thread_anchor_key("slack", str(chat_id), str(group))
+    with _thread_anchor_lock:
+        state = _read_thread_anchor_state()
+        anchors = state.setdefault("anchors", {})
+        anchors[key] = {
+            "platform": "slack",
+            "chat_id": str(chat_id),
+            "group": str(group),
+            "scope": _thread_anchor_scope(),
+            "title": str(title or ""),
+            "thread_id": str(thread_id),
+            "updated_at": _hermes_now().isoformat(),
+        }
+        _write_thread_anchor_state(state)
+
+
+def _title_from_slug(slug: str) -> str:
+    words = [w for w in re.split(r"[-_\s]+", str(slug or "")) if w]
+    if not words:
+        return "Basil Report"
+    upper = {"ai", "api", "cli", "mcp", "pdf", "wsl"}
+    return " ".join(w.upper() if w.lower() in upper else w.capitalize() for w in words)
+
+
+def _normalize_thread_title(title: str, fallback: str = "Basil Report") -> str:
+    text = str(title or "").strip()
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text)
+    text = text.strip(" \t*_`")
+    text = " ".join(text.split())
+    if not text:
+        text = fallback
+    if len(text) > _THREAD_TITLE_MAX:
+        text = text[: _THREAD_TITLE_MAX - 1].rstrip() + "..."
+    return text
+
+
+def _slack_thread_title_for_job(job: dict, content: str = "") -> str:
+    delivery_thread = job.get("delivery_thread")
+    if not isinstance(delivery_thread, dict):
+        delivery_thread = {}
+    role = str(delivery_thread.get("role") or "").strip().lower()
+    first_line = next((line.strip() for line in str(content or "").splitlines() if line.strip()), "")
+    candidates = [
+        delivery_thread.get("title"),
+        job.get("thread_title"),
+    ]
+    if role == "child" and delivery_thread.get("group"):
+        candidates.append(_title_from_slug(str(delivery_thread.get("group"))))
+    if role == "parent":
+        candidates.extend([
+            job.get("static_response"),
+            first_line,
+        ])
+    candidates.extend([
+        None if role == "parent" else job.get("static_response"),
+        job.get("name"),
+        job.get("id"),
+    ])
+    for candidate in candidates:
+        if candidate is None or not str(candidate).strip():
+            continue
+        return _normalize_thread_title(str(candidate))
+    return _normalize_thread_title(first_line)
+
+
+def _slack_delivery_thread_plan(job: dict, chat_id: str, thread_id: Optional[str], content: str) -> dict:
+    """Resolve Slack's title-parent/threaded-detail plan for a cron delivery."""
+    delivery_thread = job.get("delivery_thread")
+    if not isinstance(delivery_thread, dict):
+        delivery_thread = {}
+    group = str(delivery_thread.get("group") or "").strip()
+    role = str(delivery_thread.get("role") or "").strip().lower()
+    title = _slack_thread_title_for_job(job, content)
+
+    if thread_id:
+        return {
+            "thread_id": thread_id,
+            "thread_title": None,
+            "parent_only": False,
+            "group": group,
+            "record_anchor": False,
+            "existing_anchor": False,
+            "title": title,
+        }
+
+    existing_anchor = _lookup_slack_thread_anchor(chat_id, group) if group else None
+    if existing_anchor:
+        return {
+            "thread_id": existing_anchor,
+            "thread_title": None,
+            "parent_only": role == "parent",
+            "group": group,
+            "record_anchor": False,
+            "existing_anchor": True,
+            "title": title,
+        }
+
+    if role == "parent":
+        return {
+            "thread_id": None,
+            "thread_title": None,
+            "parent_only": True,
+            "group": group,
+            "record_anchor": bool(group),
+            "existing_anchor": False,
+            "title": title,
+        }
+
+    return {
+        "thread_id": None,
+        "thread_title": title,
+        "parent_only": False,
+        "group": group,
+        "record_anchor": bool(group),
+        "existing_anchor": False,
+        "title": title,
+    }
+
+
+def _message_id_from_send_result(result) -> Optional[str]:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        msg_id = result.get("message_id") or result.get("ts")
+        return str(msg_id) if msg_id else None
+    msg_id = getattr(result, "message_id", None)
+    return str(msg_id) if msg_id else None
+
+
+def _thread_parent_from_send_result(result) -> Optional[str]:
+    if result is None:
+        return None
+    raw = result if isinstance(result, dict) else getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        thread_id = raw.get("thread_parent_ts") or raw.get("thread_id")
+        if thread_id:
+            return str(thread_id)
+    return None
 
 
 @contextmanager
@@ -711,20 +925,54 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        slack_plan = None
+        if platform_name.lower() == "slack":
+            slack_plan = _slack_delivery_thread_plan(
+                job,
+                str(chat_id),
+                thread_id,
+                cleaned_delivery_content,
+            )
+            thread_id = slack_plan["thread_id"]
+            if slack_plan.get("parent_only") and slack_plan.get("existing_anchor"):
+                logger.info(
+                    "Job '%s': Slack thread anchor already exists for group %s",
+                    job["id"], slack_plan.get("group"),
+                )
+                continue
+
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        target_text = cleaned_delivery_content
+        target_media_files = media_files
+        thread_title = None
+        if slack_plan:
+            if slack_plan.get("parent_only"):
+                target_text = slack_plan.get("title") or _slack_thread_title_for_job(job, cleaned_delivery_content)
+                target_media_files = []
+            else:
+                thread_title = slack_plan.get("thread_title")
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
+            send_metadata = {}
+            if thread_id:
+                send_metadata["thread_id"] = thread_id
+            if thread_title:
+                send_metadata["thread_title"] = thread_title
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_text.strip()
                 adapter_ok = True
-                if text_to_send:
+                send_result = None
+                if text_to_send or thread_title:
                     from agent.async_utils import safe_schedule_threadsafe
                     future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                        runtime_adapter.send(
+                            chat_id,
+                            text_to_send,
+                            metadata=dict(send_metadata) if send_metadata else None,
+                        ),
                         loop,
                     )
                     if future is None:
@@ -755,14 +1003,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             )
                             logger.warning("Job '%s': %s", job["id"], msg)
                             delivery_errors.append(msg)
+                        elif slack_plan:
+                            parent_thread_id = (
+                                _thread_parent_from_send_result(send_result)
+                                or (
+                                    _message_id_from_send_result(send_result)
+                                    if slack_plan.get("parent_only")
+                                    else None
+                                )
+                            )
+                            if parent_thread_id and not thread_id:
+                                thread_id = parent_thread_id
+                                send_metadata["thread_id"] = parent_thread_id
+                            if (
+                                parent_thread_id
+                                and slack_plan.get("record_anchor")
+                                and slack_plan.get("group")
+                            ):
+                                _record_slack_thread_anchor(
+                                    str(chat_id),
+                                    str(slack_plan["group"]),
+                                    str(slack_plan.get("title") or thread_title or ""),
+                                    parent_thread_id,
+                                )
 
                 # Send extracted media files as native attachments via the live adapter
-                if adapter_ok and media_files:
+                if adapter_ok and target_media_files:
                     _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
-                        media_files,
-                        send_metadata,
+                        target_media_files,
+                        send_metadata or None,
                         loop,
                         job,
                         platform=platform,
@@ -779,7 +1050,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                target_text,
+                thread_id=thread_id,
+                media_files=target_media_files,
+                thread_title=thread_title,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -789,7 +1068,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(
+                        asyncio.run,
+                        _send_to_platform(
+                            platform,
+                            pconfig,
+                            chat_id,
+                            target_text,
+                            thread_id=thread_id,
+                            media_files=target_media_files,
+                            thread_title=thread_title,
+                        ),
+                    )
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
@@ -802,6 +1092,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
+
+            if slack_plan:
+                parent_thread_id = (
+                    _thread_parent_from_send_result(result)
+                    or (
+                        _message_id_from_send_result(result)
+                        if slack_plan.get("parent_only")
+                        else None
+                    )
+                )
+                if (
+                    parent_thread_id
+                    and slack_plan.get("record_anchor")
+                    and slack_plan.get("group")
+                ):
+                    _record_slack_thread_anchor(
+                        str(chat_id),
+                        str(slack_plan["group"]),
+                        str(slack_plan.get("title") or thread_title or ""),
+                        parent_thread_id,
+                    )
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
@@ -1218,6 +1529,28 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    if job.get("static_response") is not None:
+        response = str(job.get("static_response") or "").strip()
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        if not response:
+            logger.info("Job '%s' (static_response): empty response - silent run", job_id)
+            return True, (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {now_iso}\n"
+                f"**Mode:** static_response\n"
+                f"**Status:** silent (empty static_response)\n"
+            ), SILENT_MARKER, None
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** static_response\n\n"
+            f"---\n\n"
+            f"{response}\n"
+        )
+        return True, doc, response, None
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -1403,7 +1736,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import set_session_vars, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -1436,8 +1769,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
     )
+    _cron_delivery_tokens = []
     for _var_name in _cron_delivery_vars:
-        _VAR_MAP[_var_name].set("")
+        _cron_delivery_tokens.append(_VAR_MAP[_var_name].set(""))
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -1475,12 +1809,18 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
-                ""
-                if delivery_target.get("thread_id") is None
-                else str(delivery_target["thread_id"])
+            _cron_delivery_tokens.append(
+                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
+            )
+            _cron_delivery_tokens.append(
+                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+            )
+            _cron_delivery_tokens.append(
+                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
+                    ""
+                    if delivery_target.get("thread_id") is None
+                    else str(delivery_target["thread_id"])
+                )
             )
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
@@ -1512,10 +1852,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception:
             pass
 
-        # Reasoning config from config.yaml
-        from hermes_constants import parse_reasoning_effort
-        effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
-        reasoning_config = parse_reasoning_effort(effort)
+        # Reasoning config from per-job override or config.yaml
+        reasoning_config = _resolve_cron_reasoning_config(job, _cfg)
 
         # Prefill messages from env or config.yaml
         prefill_messages = None
@@ -1821,10 +2159,21 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 os.environ.pop("TERMINAL_CWD", None)
             else:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Clean up ContextVar session/delivery state for this job.
-        clear_session_vars(_ctx_tokens)
-        for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
+        # Clean up ContextVar session/delivery state for this job without
+        # poisoning callers that invoke run_job() directly in the same context.
+        # The scheduler normally runs jobs inside copy_context(), but tests and
+        # ad-hoc callers do not; resetting tokens preserves the previous
+        # os.environ fallback state instead of leaving explicit empty values.
+        for _token in reversed(_cron_delivery_tokens):
+            try:
+                _token.var.reset(_token)
+            except Exception:
+                pass
+        for _token in reversed(_ctx_tokens):
+            try:
+                _token.var.reset(_token)
+            except Exception:
+                pass
         if _session_db:
             try:
                 _session_db.end_session(_cron_session_id, "cron_complete")

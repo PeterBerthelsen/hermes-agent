@@ -219,6 +219,59 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "sk-openrouter"
 
 
+def test_resolve_session_agent_runtime_applies_channel_runtime_binding(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "global-model")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "***",
+        },
+    )
+
+    runner = _make_runner()
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key="agent:main:slack:group:C0CODE",
+        user_config={"model": {"default": "global-model"}},
+        channel_runtime={
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "reasoning_effort": "high",
+        },
+    )
+
+    assert model == "gpt-5.5"
+    assert runtime_kwargs["provider"] == "openai-codex"
+    assert runtime_kwargs["api_mode"] == "codex_responses"
+
+
+def test_session_model_override_wins_over_channel_runtime_binding(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "global-model")
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+
+    runner = _make_runner()
+    session_key = "agent:main:slack:group:C0CODE"
+    runner._session_model_overrides[session_key] = _codex_override()
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key=session_key,
+        user_config={"model": {"default": "global-model"}},
+        channel_runtime={
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "reasoning_effort": "high",
+        },
+    )
+
+    assert model == "gpt-5.4"
+    assert runtime_kwargs["provider"] == "openai-codex"
+    assert runtime_kwargs["api_key"] == "***"
+
+
 def test_gateway_auth_fallback_resolves_key_env_for_custom_provider(tmp_path, monkeypatch):
     """Auth-failure fallback should honor key_env/api_key_env custom-endpoint hints."""
     config = tmp_path / "config.yaml"
@@ -260,4 +313,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-

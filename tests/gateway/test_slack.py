@@ -2434,6 +2434,63 @@ class TestMessageSplitting:
         assert adapter._app.client.chat_postMessage.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_thread_title_metadata_posts_parent_then_threaded_details(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "parent_ts"}, {"ts": "reply_ts"}]
+        )
+
+        result = await adapter.send(
+            "C123",
+            "details",
+            metadata={"thread_title": "Report Title"},
+        )
+
+        assert result.success
+        assert result.raw_response["thread_parent_ts"] == "parent_ts"
+        calls = adapter._app.client.chat_postMessage.await_args_list
+        assert calls[0].kwargs == {
+            "channel": "C123",
+            "text": "Report Title",
+            "mrkdwn": True,
+        }
+        assert calls[1].kwargs["thread_ts"] == "parent_ts"
+        assert calls[1].kwargs["text"] == "details"
+
+    @pytest.mark.asyncio
+    async def test_thread_title_metadata_with_empty_body_posts_only_parent(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "parent_ts"})
+
+        result = await adapter.send(
+            "C123",
+            "",
+            metadata={"thread_title": "Report Title"},
+        )
+
+        assert result.success
+        assert result.message_id == "parent_ts"
+        adapter._app.client.chat_postMessage.assert_awaited_once_with(
+            channel="C123",
+            text="Report Title",
+            mrkdwn=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_title_metadata_never_broadcasts_detail_reply(self, adapter):
+        adapter.config.extra["reply_broadcast"] = True
+        adapter._app.client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "parent_ts"}, {"ts": "reply_ts"}]
+        )
+
+        await adapter.send(
+            "C123",
+            "details",
+            metadata={"thread_title": "Report Title"},
+        )
+
+        detail_kwargs = adapter._app.client.chat_postMessage.await_args_list[1].kwargs
+        assert "reply_broadcast" not in detail_kwargs
+
+    @pytest.mark.asyncio
     async def test_send_preserves_blockquote_formatting(self, adapter):
         """Blockquote '>' markers must survive format → chunk → send pipeline."""
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
