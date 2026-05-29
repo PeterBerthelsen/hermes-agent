@@ -5,6 +5,7 @@ import importlib
 import sys
 import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -137,6 +138,27 @@ class FakeAgent:
             time.sleep(0.35)
             cb("tool.started", "browser_navigate", "https://example.com", {})
             time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class PathProgressAgent:
+    """Agent that emits an absolute Hermes path in progress preview."""
+
+    HERMES_PATH = str(Path(__file__).resolve().parents[2] / "gateway" / "run.py")
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "read_file", self.HERMES_PATH, {})
+        time.sleep(0.35)
         return {
             "final_response": "done",
             "messages": [],
@@ -420,6 +442,59 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     assert adapter.sent
     assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
     assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_slack_progress_card_uses_status_fence_and_path_links(monkeypatch, tmp_path):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"slack": {"tool_progress": "all", "progress_card": True}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = PathProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="1234567890.000001",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-slack-card",
+        session_key="agent:main:slack:group:C123:1234567890.000001",
+        event_message_id="1234567890.000001",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    first_card = adapter.sent[0]["content"]
+    assert first_card.startswith("*Basil is working*")
+    assert "```status\n" in first_card
+    assert "PHASE:" in first_card
+    assert "Phase: `" not in first_card
+    assert f"[Hermes](file://{PathProgressAgent.HERMES_PATH})" in first_card
+    _, fenced = first_card.split("```status", 1)
+    assert PathProgressAgent.HERMES_PATH not in fenced
+    assert "gateway/run.py" in fenced
 
 
 @pytest.mark.asyncio

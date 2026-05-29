@@ -16184,6 +16184,10 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        _progress_card_enabled = (
+            source.platform == Platform.SLACK
+            and bool(resolve_display_setting(user_config, platform_key, "progress_card", False))
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -16317,7 +16321,7 @@ class GatewayRunner:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
+                if not _progress_card_enabled and len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
@@ -16386,6 +16390,8 @@ class GatewayRunner:
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+            _progress_started_at = time.monotonic()
+            _total_progress_events = 0
 
             _progress_len_fn = (
                 adapter.message_len_fn
@@ -16429,7 +16435,19 @@ class GatewayRunner:
                     kwargs["metadata"] = _progress_metadata
                 return await adapter.edit_message(**kwargs)
 
-            def _progress_text(lines: list) -> str:
+            def _progress_text(lines: list, *, complete: bool = False) -> str:
+                if _progress_card_enabled:
+                    try:
+                        from gateway.progress_card import render_slack_progress_card
+
+                        return render_slack_progress_card(
+                            lines,
+                            elapsed_seconds=time.monotonic() - _progress_started_at,
+                            tool_count=_total_progress_events,
+                            complete=complete,
+                        )
+                    except Exception as _card_err:
+                        logger.debug("Slack progress-card rendering failed: %s", _card_err)
                 return "\n".join(str(line) for line in lines)
 
             def _split_progress_groups(lines: list) -> list[list]:
@@ -16532,6 +16550,7 @@ class GatewayRunner:
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
+                        _total_progress_events += 1
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
@@ -16552,6 +16571,7 @@ class GatewayRunner:
                     else:
                         msg = raw
                         progress_lines.append(msg)
+                        _total_progress_events += 1
 
                     if await _roll_progress_overflow_if_needed():
                         _last_edit_ts = time.monotonic()
@@ -16578,7 +16598,7 @@ class GatewayRunner:
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -16618,7 +16638,7 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _progress_text(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -16654,6 +16674,7 @@ class GatewayRunner:
                             raw = progress_queue.get_nowait()
                             if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
+                                _total_progress_events += 1
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                     await _roll_progress_overflow_if_needed()
@@ -16674,6 +16695,7 @@ class GatewayRunner:
                                 repeat_count[0] = 0
                             else:
                                 progress_lines.append(raw)
+                                _total_progress_events += 1
                                 await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
@@ -16681,7 +16703,7 @@ class GatewayRunner:
                     if can_edit and progress_lines and progress_msg_id:
                         await _roll_progress_overflow_if_needed()
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = _progress_text(progress_lines)
+                        full_text = _progress_text(progress_lines, complete=_progress_card_enabled)
                         try:
                             await _edit_progress_message(progress_msg_id, full_text)
                         except Exception:

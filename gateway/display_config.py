@@ -46,6 +46,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Slack-only opt-in: render tool progress as a compact fenced status card
+    # with path/source links outside the fence instead of raw tool crumbs.
+    "progress_card": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -224,6 +227,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "progress_card",
     }:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}

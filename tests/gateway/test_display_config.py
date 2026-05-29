@@ -381,6 +381,37 @@ class TestStreamingPerPlatform:
 # cleanup_progress — opt-in deletion of temporary progress bubbles
 # ---------------------------------------------------------------------------
 
+class TestProgressCardSetting:
+    """``progress_card`` is opt-in and resolvable per-platform."""
+
+    def test_default_off_for_all_platforms(self):
+        from gateway.display_config import resolve_display_setting
+
+        for plat in ("telegram", "discord", "slack", "email"):
+            assert resolve_display_setting({}, plat, "progress_card") is False
+
+    def test_per_platform_true_enables_slack_card(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {"slack": {"progress_card": True}},
+            }
+        }
+        assert resolve_display_setting(config, "slack", "progress_card") is True
+        assert resolve_display_setting(config, "telegram", "progress_card") is False
+
+    def test_yaml_on_string_normalises_to_true(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {"slack": {"progress_card": "on"}},
+            }
+        }
+        assert resolve_display_setting(config, "slack", "progress_card") is True
+
+
 class TestCleanupProgress:
     """``cleanup_progress`` is off by default and resolvable per-platform."""
 
