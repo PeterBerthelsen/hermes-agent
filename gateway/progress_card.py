@@ -195,10 +195,12 @@ def render_slack_progress_card(
     if elapsed_seconds is not None:
         status_lines.append(f"ELAPSED: {_format_elapsed(elapsed_seconds)}")
     if notes:
+        status_lines.append("")
         status_lines.append("NOTES:")
         for item in notes[-_MAX_COMMENTARY_LINES:]:
             status_lines.append(f"- {item}")
     if recent:
+        status_lines.append("")
         status_lines.append("RECENT:")
         for item in recent:
             status_lines.append(f"- {item}")

@@ -41,7 +41,8 @@ def test_progress_card_renders_total_tool_count_and_public_commentary():
     )
 
     assert "TOOLS: 4" in card
-    assert "NOTES:" in card
+    assert "\n\nNOTES:\n" in card
+    assert "\n\nRECENT:\n" in card
     assert "existing gateway hooks" in card
     assert "Slack edit path" in card
 
